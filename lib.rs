@@ -53,7 +53,7 @@ extern crate slog;
 extern crate log;
 extern crate slog_scope;
 
-use log::LogMetadata;
+use log::Metadata;
 use std::{fmt, io};
 
 use slog::Level;
@@ -61,42 +61,46 @@ use slog::KV;
 
 struct Logger;
 
-fn log_to_slog_level(level: log::LogLevel) -> Level {
+static STATIC_LOGGER: Logger = Logger;
+
+fn log_to_slog_level(level: log::Level) -> Level {
     match level {
-        log::LogLevel::Trace => Level::Trace,
-        log::LogLevel::Debug => Level::Debug,
-        log::LogLevel::Info => Level::Info,
-        log::LogLevel::Warn => Level::Warning,
-        log::LogLevel::Error => Level::Error,
+        log::Level::Trace => Level::Trace,
+        log::Level::Debug => Level::Debug,
+        log::Level::Info => Level::Info,
+        log::Level::Warn => Level::Warning,
+        log::Level::Error => Level::Error,
     }
 }
 
 impl log::Log for Logger {
-    fn enabled(&self, _: &LogMetadata) -> bool {
+    fn enabled(&self, _: &Metadata) -> bool {
         true
     }
 
-    fn log(&self, r: &log::LogRecord) {
+    fn log(&self, r: &log::Record) {
         let level = log_to_slog_level(r.metadata().level());
 
         let args = r.args();
         let target = r.target();
-        let module = r.location().__module_path;
-        let file = r.location().__file;
-        let line = r.location().line();
+        let line = r.line().unwrap_or(0);
 
         let s = slog::RecordStatic {
             location: &slog::RecordLocation {
-                file: file,
+                file: "<unknown>",
                 line: line,
                 column: 0,
                 function: "",
-                module: module,
+                module: "<unknown>",
             },
             level: level,
             tag: target,
         };
         slog_scope::with_logger(|logger| logger.log(&slog::Record::new(&s, args, b!())))
+    }
+
+    fn flush(&self) {
+      // nothing is buffered
     }
 }
 
@@ -130,7 +134,7 @@ impl log::Log for Logger {
 /// }
 /// ```
 pub fn init() -> Result<(), log::SetLoggerError> {
-    init_with_level(log::LogLevel::max())
+    init_with_level(log::Level::max())
 }
 
 /// Register `slog-stdlog` as `log` backend.
@@ -164,11 +168,9 @@ pub fn init() -> Result<(), log::SetLoggerError> {
 ///     error!("standard logging redirected to slog");
 /// }
 /// ```
-pub fn init_with_level(level: log::LogLevel) -> Result<(), log::SetLoggerError> {
-    log::set_logger(|max_log_level| {
-        max_log_level.set(level.to_log_level_filter());
-        Box::new(Logger)
-    })
+pub fn init_with_level(level: log::Level) -> Result<(), log::SetLoggerError> {
+    log::set_max_level(level.to_level_filter());
+    log::set_logger(&STATIC_LOGGER)
 }
 
 /// Drain logging `Record`s into `log` crate
@@ -200,20 +202,16 @@ impl<'a> LazyLogString<'a> {
 
 impl<'a> fmt::Display for LazyLogString<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        try!(write!(f, "{}", self.info.msg()));
+        write!(f, "{}", self.info.msg())?;
 
         let io = io::Cursor::new(Vec::new());
         let mut ser = KSV::new(io);
 
-        let res = {
-            || -> io::Result<()> {
-                try!(self.logger_values.serialize(self.info, &mut ser));
-                try!(self.info.kv().serialize(self.info, &mut ser));
-                Ok(())
-            }
-        }().map_err(|_| fmt::Error);
-
-        try!(res);
+        (|| -> io::Result<()> {
+            self.logger_values.serialize(self.info, &mut ser)?;
+            self.info.kv().serialize(self.info, &mut ser)?;
+            Ok(())
+        })().map_err(|_| fmt::Error)?;
 
         let values = ser.into_inner().into_inner();
 
@@ -226,11 +224,11 @@ impl slog::Drain for StdLog {
     type Ok = ();
     fn log(&self, info: &slog::Record, logger_values: &slog::OwnedKVList) -> io::Result<()> {
         let level = match info.level() {
-            slog::Level::Critical | slog::Level::Error => log::LogLevel::Error,
-            slog::Level::Warning => log::LogLevel::Warn,
-            slog::Level::Info => log::LogLevel::Info,
-            slog::Level::Debug => log::LogLevel::Debug,
-            slog::Level::Trace => log::LogLevel::Trace,
+            slog::Level::Critical | slog::Level::Error => log::Level::Error,
+            slog::Level::Warning => log::Level::Warn,
+            slog::Level::Info => log::Level::Info,
+            slog::Level::Debug => log::Level::Debug,
+            slog::Level::Trace => log::Level::Trace,
         };
 
         let mut target = info.tag();
@@ -238,16 +236,15 @@ impl slog::Drain for StdLog {
             target = info.module();
         }
 
-        let location = log::LogLocation {
-            __module_path: info.module(),
-            __file: info.file(),
-            __line: info.line(),
-        };
-
         let lazy = LazyLogString::new(info, logger_values);
-        // Please don't yell at me for this! :D
-        // https://github.com/rust-lang-nursery/log/issues/95
-        log::__log(level, target, &location, format_args!("{}", lazy));
+        log::logger().log(&log::Record::builder()
+            .args(format_args!("{}", lazy))
+            .level(level)
+            .target(target)
+            .file(Some(info.file()))
+            .line(Some(info.line()))
+            .module_path(Some(info.module()))
+            .build());
 
         Ok(())
     }
